@@ -1,0 +1,1530 @@
+"use strict";
+
+/* ---------- Speicher ---------- */
+const store = {
+  get(key, fallback) {
+    try { const v = localStorage.getItem("dbpl:" + key); return v ? JSON.parse(v) : fallback; }
+    catch { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem("dbpl:" + key, JSON.stringify(value)); } catch { /* voll oder gesperrt */ }
+  },
+};
+
+const $ = (sel, root = document) => root.querySelector(sel);
+const esc = (s = "") => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const scroller = $("#scroller");
+const shuffle = (a) => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+const dayKey = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/* ---------- Tabs ---------- */
+const views = { news: $("#view-news"), lesen: $("#view-lesen"), learn: $("#view-learn") };
+const scrollPos = { news: 0, lesen: 0, learn: 0 };
+let currentTab = store.get("tab", "news");
+if (!views[currentTab]) currentTab = "news";
+let lastY = 0;
+
+function showTab(tab) {
+  scrollPos[currentTab] = scroller.scrollTop;
+  currentTab = tab;
+  store.set("tab", tab);
+  for (const [name, el] of Object.entries(views)) el.hidden = name !== tab;
+  document.querySelectorAll(".tabbar button").forEach((b) => {
+    if (b.dataset.tab === tab) b.setAttribute("aria-current", "page");
+    else b.removeAttribute("aria-current");
+  });
+  scroller.scrollTo(0, scrollPos[tab] || 0);
+  lastY = scrollPos[tab] || 0;
+  document.querySelectorAll(".news-tools").forEach((t) => t.classList.remove("hide"));
+  if (tab === "learn") renderLearn();
+}
+document.querySelectorAll(".tabbar button").forEach((b) =>
+  b.addEventListener("click", () => {
+    if (b.dataset.tab === currentTab) scroller.scrollTo({ top: 0, behavior: "smooth" });
+    else showTab(b.dataset.tab);
+  })
+);
+
+/* =================================================================
+   NACHRICHTEN und LESEN
+   ================================================================= */
+const news = { items: [], updated: null, loadedAt: 0, paywall: 0 };
+const readIds = new Set(store.get("read", []));
+
+const TOPICS = {
+  politik: "Polityka", wirtschaft: "Gospodarka", boerse: "Giełda", technik: "Technologia",
+  wissenschaft: "Nauka", sport: "Sport", kultur: "Kultura",
+  psychologie: "Psychologia", geschichte: "Historia", philosophie: "Filozofia",
+  gesellschaft: "Społeczeństwo", gesundheit: "Zdrowie",
+};
+const LANGS = ["alle", "pl", "en"];
+const LANG_LABEL = { alle: "Wszystkie", pl: "PL", en: "EN" };
+const savedFilters = store.get("filters", {});
+let langFilter = LANGS.includes(savedFilters.lang) ? savedFilters.lang : "alle";
+const feedUI = {
+  news: { list: "#news-list", topics: "#news-topics", region: savedFilters.region || "alle", topic: savedFilters.newsTopic || "alle", query: "" },
+  lesen: { list: "#lesen-list", topics: "#lesen-topics", topic: savedFilters.lesenTopic || "alle", query: "" },
+};
+const saveFilters = () => store.set("filters", { region: feedUI.news.region, newsTopic: feedUI.news.topic, lesenTopic: feedUI.lesen.topic, lang: langFilter });
+
+function markRead(id) {
+  readIds.add(id);
+  store.set("read", [...readIds].slice(-3000));
+}
+
+async function loadNews() {
+  try {
+    const res = await fetch("news.json?t=" + Date.now(), { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status);
+    const data = await res.json();
+    news.loadedAt = Date.now();
+    if (data.updated && data.updated === news.updated && news.items.length) return; // nichts Neues: kein Neuaufbau
+    // ältere news.json ohne Bereich/Thema bleibt lesbar
+    news.items = (data.items || []).map((it) => ({
+      ...it,
+      section: it.section || "news",
+      region: it.region ?? it.category ?? "beide",
+      topic: it.topic || "politik",
+      lang: it.lang || "pl",
+    }));
+    news.updated = data.updated;
+    news.paywall = data.stats?.paywallRemoved || 0;
+  } catch {
+    if (!news.items.length) $("#news-sub").textContent = "Brak połączenia. Brak zapisanych wiadomości.";
+  }
+  renderFeed("news");
+  renderFeed("lesen");
+}
+
+function relTime(iso) {
+  if (!iso) return "";
+  const diff = (Date.now() - Date.parse(iso)) / 60000;
+  if (diff < 1) return "przed chwilą";
+  if (diff < 60) return `${Math.round(diff)} min temu`;
+  return new Date(iso).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" });
+}
+
+function dayLabel(iso) {
+  if (!iso) return "Bez daty";
+  const d = new Date(iso);
+  const today = dayKey();
+  const y = new Date(); y.setDate(y.getDate() - 1);
+  if (dayKey(d) === today) return "Dzisiaj";
+  if (dayKey(d) === dayKey(y)) return "Wczoraj";
+  return d.toLocaleDateString("pl-PL", { weekday: "long", day: "numeric", month: "long" });
+}
+
+function renderFeed(section) {
+  const ui = feedUI[section];
+  const list = $(ui.list);
+  const box = $(ui.topics);
+
+  if (section === "news") {
+    const dateText = new Date().toLocaleDateString("pl-PL", { weekday: "long", day: "numeric", month: "long" });
+    const stand = news.updated
+      ? ` · stan na ${new Date(news.updated).toLocaleTimeString("pl-PL", { hour: "2-digit", minute: "2-digit" })}`
+      : "";
+    const paid = news.paywall ? ` · ukryto ${news.paywall} ${plural(news.paywall, ["płatny artykuł", "płatne artykuły", "płatnych artykułów"])}` : "";
+    $("#news-sub").textContent = dateText + stand + paid;
+  }
+
+  const all = news.items.filter((it) => it.section === section);
+  if (!all.length) {
+    box.innerHTML = "";
+    list.innerHTML = `<div class="empty"><strong>Brak wpisów</strong>
+      Dane pojawią się po następnym uruchomieniu GitHub Action. Uruchom je w zakładce Actions przyciskiem „Run workflow”.</div>`;
+    return;
+  }
+
+  // Region (nur Nachrichten) und Themen-Chips; Themen ohne Einträge werden ausgeblendet
+  const inRegion = all.filter((it) =>
+    (langFilter === "alle" || it.lang === langFilter) &&
+    (section !== "news" || ui.region === "alle" || it.region === ui.region || it.region === "beide"));
+  const counts = {};
+  inRegion.forEach((it) => { counts[it.topic] = (counts[it.topic] || 0) + 1; });
+  if (ui.topic !== "alle" && !counts[ui.topic]) ui.topic = "alle";
+  const keep = box.scrollLeft;
+  box.innerHTML = [["alle", "Wszystkie"], ...Object.keys(TOPICS).filter((k) => counts[k]).map((k) => [k, TOPICS[k]])]
+    .map(([k, label]) => `<button role="radio" aria-checked="${k === ui.topic}" data-topic="${k}">${label}</button>`).join("");
+  box.scrollLeft = keep;
+
+  const q = ui.query.trim().toLowerCase();
+  const items = inRegion.filter((it) =>
+    (ui.topic === "alle" || it.topic === ui.topic) &&
+    (!q || (it.title + " " + it.summary + " " + it.source).toLowerCase().includes(q))
+  );
+
+  if (!items.length) {
+    list.innerHTML = `<div class="empty"><strong>Brak wyników</strong>
+      ${q ? `Dla „${esc(ui.query)}” na razie nic nie ma.` : "W tym wyborze na razie nic nie ma."} Spróbuj innego słowa, innego tematu albo języka „Wszystkie”.</div>`;
+    return;
+  }
+
+  let html = "";
+  let lastDay = "";
+  for (const it of items) {
+    const label = dayLabel(it.date);
+    if (label !== lastDay) { html += `<h2 class="day-label">${esc(label)}</h2>`; lastDay = label; }
+    const chip = ui.topic === "alle" && TOPICS[it.topic] ? `<span class="cat">${TOPICS[it.topic]}</span>` : "";
+    const en = it.lang === "en" ? `<span class="cat">EN</span>` : "";
+    const time = section === "news" ? `<span>${esc(relTime(it.date))}</span>` : "";
+    html += `
+      <a class="news-item${readIds.has(it.id) ? " read" : ""}" href="${esc(it.link)}" target="_blank" rel="noopener" data-id="${esc(it.id)}">
+        <div>
+          <div class="news-meta"><span class="src">${esc(it.source)}</span>${time}${chip}${en}</div>
+          <h3 class="news-title">${esc(it.title)}</h3>
+          ${it.summary ? `<p class="news-summary">${esc(it.summary)}</p>` : ""}
+        </div>
+        ${it.image ? `<img class="news-thumb" src="${esc(it.image)}" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
+      </a>`;
+  }
+  list.innerHTML = html;
+  if (pendingScroll && pendingScroll.tab === section && currentTab === section) {
+    const y = pendingScroll.y; pendingScroll = null;
+    requestAnimationFrame(() => { lastY = y; scroller.scrollTo(0, y); });
+  }
+}
+
+/* Scroll-Position merken, damit die Liste nach dem Zurückkehren nicht oben neu startet */
+let pendingScroll = null;
+const savedScroll = store.get("scroll", null);
+if (savedScroll && savedScroll.tab === currentTab && Date.now() - savedScroll.t < 30 * 60 * 1000) {
+  pendingScroll = { tab: savedScroll.tab, y: savedScroll.y };
+}
+const saveScroll = () => {
+  if ((currentTab === "news" || currentTab === "lesen") && $("#quiz").hidden) {
+    store.set("scroll", { y: scroller.scrollTop, t: Date.now(), tab: currentTab });
+  }
+};
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") saveScroll(); });
+window.addEventListener("pagehide", saveScroll);
+
+document.querySelectorAll(".feed-list").forEach((list) =>
+  list.addEventListener("click", (e) => {
+    const a = e.target.closest(".news-item");
+    if (!a) return;
+    saveScroll();
+    markRead(a.dataset.id);
+    a.classList.add("read");
+  })
+);
+
+// Themen-Chips (Nachrichten und Lesen)
+document.querySelectorAll(".topics").forEach((box) =>
+  box.addEventListener("click", (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    feedUI[box.dataset.section].topic = b.dataset.topic;
+    saveFilters();
+    renderFeed(box.dataset.section);
+  })
+);
+
+// Region (nur Nachrichten)
+const markRegion = () => document.querySelectorAll(".segmented button")
+  .forEach((x) => x.setAttribute("aria-selected", String(x.dataset.cat === feedUI.news.region)));
+markRegion();
+document.querySelectorAll(".segmented button").forEach((b) =>
+  b.addEventListener("click", () => {
+    feedUI.news.region = b.dataset.cat;
+    saveFilters();
+    markRegion();
+    renderFeed("news");
+  })
+);
+
+// Sprache (gilt für Nachrichten und Lesen)
+const markLang = () => document.querySelectorAll(".lang-btn").forEach((b) => {
+  b.textContent = LANG_LABEL[langFilter];
+  b.dataset.lang = langFilter;
+  b.title = { alle: "Wszystkie języki", pl: "Tylko polski", en: "Tylko angielski" }[langFilter];
+});
+markLang();
+document.querySelectorAll(".lang-btn").forEach((b) =>
+  b.addEventListener("click", () => {
+    langFilter = LANGS[(LANGS.indexOf(langFilter) + 1) % LANGS.length];
+    saveFilters();
+    markLang();
+    renderFeed("news");
+    renderFeed("lesen");
+  })
+);
+
+let searchTimer;
+[["news", "#news-search"], ["lesen", "#lesen-search"]].forEach(([section, sel]) =>
+  $(sel).addEventListener("input", (e) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { feedUI[section].query = e.target.value; renderFeed(section); }, 120);
+  })
+);
+
+/* Filterleiste: beim Runterscrollen ausblenden, beim Hochscrollen wieder zeigen */
+scroller.addEventListener("scroll", () => {
+  const y = scroller.scrollTop;
+  const hide = y > 160 && y > lastY + 4;
+  const show = y < lastY - 4 || y <= 160;
+  if (hide || show) document.querySelectorAll(".news-tools").forEach((t) => t.classList.toggle("hide", hide));
+  lastY = y;
+}, { passive: true });
+
+/* Zum Aktualisieren ziehen */
+(() => {
+  const pull = $("#pull");
+  let startY = null, dist = 0;
+  window.addEventListener("touchstart", (e) => {
+    if ((currentTab !== "news" && currentTab !== "lesen") || scroller.scrollTop > 0 || !$("#quiz").hidden) return;
+    startY = e.touches[0].clientY; dist = 0; pull.classList.add("dragging");
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (startY === null) return;
+    dist = Math.max(0, e.touches[0].clientY - startY);
+    pull.style.height = Math.min(dist * 0.5, 60) + "px";
+    pull.firstElementChild.textContent = dist > 120 ? "Puść, aby odświeżyć" : "Pociągnij, aby odświeżyć";
+  }, { passive: true });
+  window.addEventListener("touchend", async () => {
+    if (startY === null) return;
+    pull.classList.remove("dragging");
+    const go = dist > 120;
+    startY = null;
+    if (go) {
+      pull.firstElementChild.textContent = "Odświeżanie";
+      await loadNews();
+    }
+    pull.style.height = "0px";
+  });
+})();
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && Date.now() - news.loadedAt > 10 * 60 * 1000) loadNews();
+});
+
+/* =================================================================
+   LERNEN
+   ================================================================= */
+let countries = [];
+let CONTENT = null;        // Ereignisse, Aussagen, Karten, Personen (content.json)
+let MAPD = null;           // Weltkarte (map.json)
+let MAP_MARKUP = "";
+const PEOPLE = {};         // id -> Person
+let PORTRAITS = {};        // id -> { file, artist, license, page, v } (portraits/portraits.json)
+const CARD = {};           // id -> Karte
+const MAPIDX = {};         // Länderkürzel -> { s: größte Kantenlänge }
+const REGIONS = ["Wszystkie", "Europa", "Azja", "Afryka", "Ameryka", "Oceania"];
+let region = store.get("region", "Wszystkie");
+
+const THIS_YEAR = new Date().getFullYear();
+const plural = (n, [one, few, many]) => (n === 1 ? one : n % 10 >= 2 && n % 10 <= 4 && !(n % 100 >= 12 && n % 100 <= 14) ? few : many);
+const fmtYear = (y) => (y < 0 ? `${-y} p.n.e.` : String(y));
+const lifeSpan = (p) => `${p.approx ? "ok. " : ""}${fmtYear(p.b)} – ${fmtYear(p.d)}`;
+const initials = (name) => {
+  const w = name.replace(/ (Jr\.|Wielki|[IVX]+\.?)(?= |$)/g, "").split(" ").filter((x) => /^[A-ZĄĆĘŁŃÓŚŹŻ]/.test(x));
+  return w.length > 1 ? w[0][0] + w[w.length - 1][0] : (w[0] || "?")[0];
+};
+const nameOf = (id) => countries.find((c) => c.id === id)?.name || "";
+const ERA_LABEL = { antike: "Starożytność", mittelalter: "Średniowiecze i renesans", neuzeit: "Czasy nowożytne", j19: "XIX wiek", j20: "XX wiek" };
+const PTOPIC_LABEL = { politik: "Polityka i historia", wissen: "Nauka i technika", wirtschaft: "Gospodarka", kultur: "Kultura i filozofia" };
+const CTOPIC_LABEL = { wirtschaft: "Gospodarka", geschichte: "Historia", wissenschaft: "Nauka", politik: "Polityka" };
+
+/* ---------- Spiele ---------- */
+const COUNTRY_MODES = [
+  {
+    id: "capital", title: "Stolice", sub: "Widzisz kraj, wybierasz stolicę", icon: "🏛️",
+    usable: (c) => !c.noCapitalQuiz,
+    prompt: (c) => `<p class="prompt-label">Stolica kraju</p><h2 class="prompt-big">${esc(c.name)}</h2><div class="prompt-small-flag">${c.flag}</div>`,
+    answerLabel: (c) => esc(c.capital), answerText: (c) => c.capital,
+    distinct: (c) => c.capital,
+  },
+  {
+    id: "capital-rev", title: "Który kraj?", sub: "Widzisz stolicę, wybierasz kraj", icon: "Rzym", iconText: true,
+    usable: (c) => !c.noCapitalQuiz,
+    prompt: (c) => `<p class="prompt-label">Stolicą którego kraju jest</p><h2 class="prompt-big">${esc(c.capital)}</h2>`,
+    answerLabel: (c) => esc(c.name), answerText: (c) => c.name,
+    distinct: (c) => c.name,
+  },
+  {
+    id: "flag", title: "Flagi", sub: "Widzisz flagę, wybierasz kraj", icon: "🇨🇿",
+    usable: () => true,
+    prompt: (c) => `<p class="prompt-label">Do jakiego kraju należy ta flaga?</p><p class="prompt-flag" aria-label="Flaga">${c.flag}</p>`,
+    answerLabel: (c) => esc(c.name), answerText: (c) => c.name,
+    distinct: (c) => c.name,
+  },
+  {
+    id: "flag-rev", title: "Znajdź flagę", sub: "Widzisz kraj, wybierasz flagę", icon: "🏳️",
+    usable: () => true, flagAnswers: true,
+    prompt: (c) => `<p class="prompt-label">Która flaga należy do</p><h2 class="prompt-big">${esc(c.name)}</h2>`,
+    answerLabel: (c) => `<span aria-label="Flaga: ${esc(c.name)}">${c.flag}</span>`, answerText: (c) => c.name,
+    distinct: (c) => c.flag,
+  },
+];
+COUNTRY_MODES.forEach((m) => { m.kind = "country"; m.sr = true; m.short = m.title; m.pick = () => pickFrom(m.id, pool(m)); });
+
+// Karte: nur Länder, die auf dem Handy groß genug zum Antippen sind
+function mapUsable(c) {
+  const m = MAPIDX[c.id];
+  if (!m || !MAPD) return false;
+  const v = MAPD.views[region === "Wszystkie" ? c.region : region] || MAPD.views.Wszystkie;
+  const px = Math.min(window.innerWidth || 390, 640) - 40;
+  return m.s * (px / v[2]) >= 14;
+}
+const MAP_MODE = {
+  id: "map", kind: "map", title: "Mapa", sub: "Dotknij kraju na mapie", icon: "🗺️", sr: true, short: "Mapa",
+  usable: mapUsable, pick: () => pickFrom("map", pool(MAP_MODE)),
+};
+
+const GAMES = [
+  ...COUNTRY_MODES, MAP_MODE,
+  { id: "tf", kind: "tf", title: "Prawda czy fałsz", sub: "Czy to zdanie jest prawdziwe?", icon: "P/F", iconText: true, sr: true, short: "Prawda/Fałsz", know: true,
+    pick: () => pickFrom("tf", CONTENT.facts) },
+  { id: "before", kind: "before", title: "Wcześniej czy później?", sub: "Które wydarzenie było pierwsze?", icon: "⏳", short: "Wcześniej/Później", know: true,
+    pick: () => pickPairs() },
+  { id: "year", kind: "year", title: "Zgadnij rok", sub: "Im bliżej, tym więcej punktów", icon: "📅", scored: true, short: "Zgadnij rok", know: true,
+    pick: () => shuffle(CONTENT.events).slice(0, 10) },
+  { id: "timeline", kind: "timeline", title: "Oś czasu", sub: "Ułóż pięć wydarzeń po kolei", icon: "📜", short: "Oś czasu", know: true,
+    pick: () => pickSets(5) },
+  { id: "who", kind: "who", title: "Teczka", sub: "Odkryj zdjęcie, odgadnij postać", icon: "🕵️", sr: true, scored: true, short: "Teczka", know: true,
+    pick: () => pickWho() },
+  { id: "duel", kind: "duel", title: "Pojedynek epok", sub: "Kto żył wcześniej, kto tu nie pasuje?", icon: "⚔️", short: "Pojedynek", know: true,
+    pick: () => pickDuels() },
+  { id: "quote", kind: "quote", title: "Zagadka cytatów", sub: "Kto jest autorem cytatu?", icon: "💬", sr: true, short: "Cytaty", know: true,
+    pick: () => pickFrom("quote", CONTENT.quotes) },
+  { id: "links", kind: "links", title: "Powiązania", sub: "Znajdź drogę od postaci do postaci", icon: "🕸️", scored: true, short: "Powiązania", know: true,
+    pick: () => pickRoutes() },
+  { id: "face", kind: "face", title: "Twarze", sub: "Widzisz portret, wybierasz postać", icon: "🖼️", sr: true, short: "Twarze", know: true,
+    avail: () => hasPhotos(), pick: () => pickFrom("face", CONTENT.people.filter((p) => photoUrl(p.id))) },
+];
+const DECK = { id: "cards", kind: "deck", title: "Karty dnia", sr: true, noAgain: true, short: "Karty dnia" };
+const gameById = (id) => GAMES.find((g) => g.id === id);
+
+/* ---------- Fortschritt: Lernkasten-System ----------
+   Kasten 0 = falsch beantwortet, 1..5 = immer sicherer. Ab Kasten 3 gilt etwas als „sicher“. */
+const INTERVAL_DAYS = [0, 0, 1, 3, 7, 21];
+const MASTERED = 3;
+let progress = store.get("progress", {});
+let activity = store.get("activity", []);
+
+function rec(modeId, id) { return progress[modeId]?.[id]; }
+function saveRec(modeId, id, correct) {
+  progress[modeId] ??= {};
+  const r = progress[modeId][id] ?? { box: 0, due: 0, seen: 0, wrong: 0 };
+  r.seen++;
+  if (correct) r.box = Math.min(5, r.box + 1);
+  else { r.box = 0; r.wrong++; }
+  r.due = Date.now() + INTERVAL_DAYS[r.box] * 86400000;
+  progress[modeId][id] = r;
+  store.set("progress", progress);
+}
+
+function pool(mode) {
+  return countries.filter((c) => mode.usable(c) && (region === "Wszystkie" || c.region === region));
+}
+
+// Auswahl: erst fällige Wiederholungen, dann Neues, dann das am längsten Ungeübte
+function pickFrom(modeId, all, n = 10) {
+  const now = Date.now();
+  const due = shuffle(all.filter((c) => { const r = rec(modeId, c.id); return r && r.box < 5 && r.due <= now; }))
+    .sort((a, b) => rec(modeId, a.id).box - rec(modeId, b.id).box);
+  const fresh = shuffle(all.filter((c) => !rec(modeId, c.id)));
+  const rest = shuffle(all.filter((c) => !due.includes(c) && !fresh.includes(c)))
+    .sort((a, b) => rec(modeId, a.id).due - rec(modeId, b.id).due);
+  const out = [...due.slice(0, 5)];
+  for (const list of [fresh, due.slice(5), rest]) for (const c of list) if (out.length < n && !out.includes(c)) out.push(c);
+  return shuffle(out.slice(0, n));
+}
+
+function options(mode, target) {
+  const all = countries.filter((c) => mode.usable(c) && c.id !== target.id && mode.distinct(c) !== mode.distinct(target));
+  const near = shuffle(all.filter((c) => c.region === target.region));
+  const far = shuffle(all.filter((c) => c.region !== target.region));
+  return shuffle([target, ...[...near, ...far].slice(0, 3)]);
+}
+
+// Paare für „Früher oder später?“
+function pickPairs(n = 10) {
+  const ev = shuffle(CONTENT.events), used = new Set(), out = [];
+  for (const a of ev) {
+    if (used.has(a.id)) continue;
+    const cand = ev.filter((x) => !used.has(x.id) && x.id !== a.id && Math.abs(x.y - a.y) >= 8);
+    const near = cand.filter((x) => Math.abs(x.y - a.y) <= 200);
+    const list = near.length && Math.random() < 0.7 ? near : cand;
+    if (!list.length) continue;
+    const b = list[Math.floor(Math.random() * list.length)];
+    used.add(a.id); used.add(b.id); out.push([a, b]);
+    if (out.length >= n) break;
+  }
+  return out;
+}
+
+// Fünfer-Gruppen für den Zeitstrahl (Abstand mindestens 6 Jahre)
+function pickSets(n = 5, size = 5) {
+  const used = new Set(), sets = [];
+  for (let tries = 0; tries < 200 && sets.length < n; tries++) {
+    const set = [];
+    for (const e of shuffle(CONTENT.events)) {
+      if (used.has(e.id)) continue;
+      if (set.every((x) => Math.abs(x.y - e.y) >= 6)) set.push(e);
+      if (set.length === size) break;
+    }
+    if (set.length === size) { set.forEach((e) => used.add(e.id)); sets.push(set); }
+  }
+  return sets;
+}
+
+/* ---------- Lernen-Übersicht ---------- */
+function streakInfo() {
+  const set = new Set(activity);
+  let n = 0;
+  const d = new Date();
+  if (!set.has(dayKey(d))) d.setDate(d.getDate() - 1);
+  while (set.has(dayKey(d))) { n++; d.setDate(d.getDate() - 1); }
+  return { n, today: set.has(dayKey()), set };
+}
+
+const CHEVRON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
+function row({ attr, icon, iconText, title, sub, pct }) {
+  return `
+    <button class="mode" ${attr}>
+      <span class="mode-icon${iconText ? " text" : ""}" aria-hidden="true">${icon}</span>
+      <span>
+        <span class="mode-title">${title}</span>
+        <span class="mode-sub" style="display:block">${sub}</span>
+        ${pct == null ? "" : `<span class="bar" aria-hidden="true"><b style="width:${pct}%"></b></span>`}
+      </span>
+      ${CHEVRON}
+    </button>`;
+}
+
+function gameStats(g) {
+  const now = Date.now();
+  let list = null;
+  if (g.kind === "country" || g.kind === "map") list = pool(g);
+  else if (g.id === "tf") list = CONTENT?.facts;
+  else if (g.id === "who") list = CONTENT?.people;
+  else if (g.id === "face") list = CONTENT?.people.filter((p) => photoUrl(p.id));
+  else if (g.id === "quote") list = CONTENT?.quotes;
+  if (list) {
+    const mastered = list.filter((x) => (rec(g.id, x.id)?.box ?? 0) >= MASTERED).length;
+    const due = list.filter((x) => { const r = rec(g.id, x.id); return r && r.box < 5 && r.due <= now; }).length;
+    return { sub: `${mastered} z ${list.length} opanowanych${due ? `, ${due} do powtórki` : ""}`, pct: list.length ? Math.round((mastered / list.length) * 100) : 0 };
+  }
+  const best = store.get("best", {})[g.id];
+  return { sub: best != null ? `Najlepsza runda: ${best} poprawnych` : g.sub, pct: null };
+}
+const gameRow = (g) => { const s = gameStats(g); return row({ attr: `data-game="${g.id}"`, icon: g.icon, iconText: g.iconText, title: g.title, sub: s.sub, pct: s.pct }); };
+
+const masteredTotal = () => Object.values(progress).reduce((s, m) => s + Object.values(m).filter((r) => r.box >= MASTERED).length, 0);
+
+function mastery(id) {
+  let seen = false, sure = 0;
+  for (const m of ["capital", "capital-rev", "flag", "flag-rev", "map"]) {
+    const r = rec(m, id);
+    if (r) { seen = true; if (r.box >= MASTERED) sure++; }
+  }
+  return !seen ? 0 : sure >= 3 ? 3 : sure >= 1 ? 2 : 1;
+}
+
+function renderLearn() {
+  if (!countries.length) return;
+  const { n, today, set } = streakInfo();
+  const week = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    week.push(`<i class="${set.has(dayKey(d)) ? "on" : ""}" title="${d.toLocaleDateString("pl-PL")}">${d.toLocaleDateString("pl-PL", { weekday: "narrow" })}</i>`);
+  }
+  $("#streak").innerHTML = `
+    <div class="streak-num">${n}</div>
+    <div class="streak-text">
+      <strong>${plural(n, ["dzień z rzędu", "dni z rzędu", "dni z rzędu"])}</strong>
+      <span>${today ? "Dzisiaj zrobione. Świetnie." : "Zagraj dziś rundę, aby utrzymać serię."}</span>
+      <div class="week" aria-label="Ostatnie 7 dni">${week.join("")}</div>
+    </div>`;
+  $("#learn-sub").textContent = `Pewnie znasz już ${masteredTotal()} ${plural(masteredTotal(), ["odpowiedź", "odpowiedzi", "odpowiedzi"])}`;
+
+  // Tagesstapel, Wissen und Personen
+  const know = $("#modes-know");
+  if (CONTENT) {
+    const d = deckState();
+    const done = d.pos >= d.ids.length;
+    $("#deck-row").innerHTML = row({
+      attr: 'data-open="deck"', icon: done ? "✓" : "🗂️", iconText: done,
+      title: "Karty dnia",
+      sub: done ? "Dziś gotowe. Jutro czeka 10 nowych kart." : `${d.pos} z ${d.ids.length} kart dzisiaj${d.reviews ? `, w tym powtórki: ${d.reviews}` : ""}`,
+      pct: Math.round((d.pos / d.ids.length) * 100),
+    });
+    know.innerHTML = GAMES.filter((g) => g.know && (!g.avail || g.avail())).map(gameRow).join("");
+    const found = discovered().length;
+    $("#atlas-row").innerHTML = row({
+      attr: 'data-open="atlas"', icon: "🧭", title: "Album postaci",
+      sub: `Odkryto ${found} z ${CONTENT.people.length} postaci`, pct: Math.round((found / CONTENT.people.length) * 100),
+    });
+  } else {
+    $("#deck-row").innerHTML = ""; $("#atlas-row").innerHTML = "";
+    know.innerHTML = `<div class="empty"><strong>Brak treści</strong>Nie udało się wczytać pliku content.json.</div>`;
+  }
+
+  // Welt-Quiz
+  $("#regions").innerHTML = REGIONS.map((r) =>
+    `<button role="radio" aria-checked="${r === region}" data-region="${r}">${r}</button>`).join("");
+  $("#modes").innerHTML = [...COUNTRY_MODES, ...(MAPD ? [MAP_MODE] : [])].map(gameRow).join("");
+
+  // Wissenskarte
+  if (MAPD) {
+    const v = MAPD.views.Wszystkie;
+    const quiz = new Set(countries.map((c) => c.id));
+    let sure = 0;
+    const paths = MAPD.countries.map((m) => {
+      const lvl = m.i && quiz.has(m.i) ? mastery(m.i) : -1;
+      return `<path class="land ${lvl < 0 ? "bg" : "k" + lvl}" d="${m.d}"/>`;
+    }).join("");
+    countries.forEach((c) => { if (mastery(c.id) === 3) sure++; });
+    $("#know-sub").textContent = `Pewnie znasz ${sure} z ${countries.length} krajów. Mapa wypełnia się, im więcej ćwiczysz.`;
+    $("#know-map").innerHTML = `<svg viewBox="${v.join(" ")}" role="img" aria-label="Mapa świata z Twoim postępem">${paths}</svg>
+      <div class="legend"><span><i class="k0"></i>nieznane</span><span><i class="k1"></i>w ćwiczeniu</span><span><i class="k2"></i>częściowo pewne</span><span><i class="k3"></i>pewne</span></div>`;
+  }
+}
+
+$("#regions").addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  region = b.dataset.region; store.set("region", region); renderLearn();
+});
+$("#view-learn").addEventListener("click", (e) => {
+  const b = e.target.closest(".mode"); if (!b) return;
+  if (b.dataset.game) startQuiz(gameById(b.dataset.game));
+  else if (b.dataset.open === "deck") startDeck();
+  else if (b.dataset.open === "atlas") openSheet(atlasView);
+});
+
+/* ---------- Quiz-Rahmen ---------- */
+let quiz = null;
+let nextTimer;
+
+function showQuiz() {
+  $("#quiz").hidden = false;
+  document.body.style.overflow = "hidden";
+}
+
+function startQuiz(game) {
+  clearTimeout(nextTimer);
+  const questions = game.pick();
+  if (!questions.length) return;
+  quiz = { mode: game, questions, i: 0, results: [], points: 0 };
+  if (game.kind === "who") preloadPhotos(questions.map((q) => q.p));
+  else if (game.kind === "face") preloadPhotos(questions);
+  else if (game.kind === "duel") preloadPhotos(questions.flatMap((q) => q.people));
+  showQuiz();
+  renderModeSwitcher();
+  renderQuestion();
+}
+
+function renderModeSwitcher() {
+  const avail = GAMES.filter((g) => (g.know ? !!CONTENT : g.kind === "map" ? !!MAPD : true) && (!g.avail || g.avail()));
+  $("#quiz-modes").innerHTML = avail.map((g) =>
+    `<button role="radio" aria-checked="${g.id === quiz.mode.id}" data-mode="${g.id}">${g.short}</button>`).join("");
+  const box = $("#quiz-modes"), act = box.querySelector('[aria-checked="true"]');
+  if (act) box.scrollLeft = act.getBoundingClientRect().left - box.getBoundingClientRect().left + box.scrollLeft - (box.clientWidth - act.offsetWidth) / 2;
+  else box.scrollLeft = 0;
+}
+$("#quiz-modes").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b || !quiz || b.dataset.mode === quiz.mode.id) return;
+  startQuiz(gameById(b.dataset.mode));
+});
+
+function closeQuiz() {
+  clearTimeout(nextTimer);
+  $("#quiz").hidden = true;
+  document.body.style.overflow = "";
+  quiz = null;
+  renderLearn();
+}
+$("#quiz-close").addEventListener("click", closeQuiz);
+
+function renderDots() {
+  $("#quiz-dots").innerHTML = quiz.questions.map((_, i) => {
+    const r = quiz.results[i];
+    const cls = r === undefined ? (i === quiz.i ? "now" : "") : r.correct ? "ok" : "no";
+    return `<li class="${cls}"></li>`;
+  }).join("");
+  $("#quiz-count").textContent = `${Math.min(quiz.i + 1, quiz.questions.length)}/${quiz.questions.length}`;
+}
+
+const RENDER = {
+  country: (t) => renderCountry(t), map: (t) => renderMap(t), tf: (t) => renderTF(t), before: (t) => renderBefore(t),
+  year: (t) => renderYear(t), timeline: (t) => renderTimeline(t), deck: (t) => renderDeck(t), face: (t) => renderFace(t), duel: (t) => renderDuel(t), quote: (t) => renderQuote(t), links: (t) => renderLinks(t),
+  who: (t) => (t.mode === "learn" ? renderLearnCard(t) : renderAkte(t)),
+};
+function renderQuestion() {
+  renderDots();
+  RENDER[quiz.mode.kind](quiz.questions[quiz.i]);
+}
+
+// Ergebnis einer Frage festhalten und weiterschalten
+function settle({ correct, show, feedback = "", auto = correct, delay = 650, pts = 0, after }) {
+  quiz.results[quiz.i] = { correct, show, pts };
+  quiz.points += pts;
+  renderDots();
+  const fb = $("#feedback");
+  if (auto) {
+    fb.innerHTML = feedback;
+    nextTimer = setTimeout(next, delay);
+  } else {
+    fb.innerHTML = `${feedback}<button class="btn" id="next">Dalej</button>`;
+    $("#next").addEventListener("click", next);
+  }
+  after?.();
+}
+
+function next() {
+  if (!quiz) return;
+  quiz.i++;
+  if (quiz.i < quiz.questions.length) renderQuestion();
+  else renderResult();
+}
+
+const FEEDBACK = '<div class="feedback" id="feedback"></div>';
+
+/* ---------- Länder-Spiele ---------- */
+function renderCountry(target) {
+  const { mode } = quiz;
+  const opts = options(mode, target);
+  $("#quiz-body").innerHTML = `
+    <div class="prompt">${mode.prompt(target)}</div>
+    <div class="answers${mode.flagAnswers ? " flags" : ""}">
+      ${opts.map((o) => `<button class="answer" data-id="${o.id}">${mode.answerLabel(o)}</button>`).join("")}
+    </div>${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) =>
+    btn.addEventListener("click", () => answerCountry(btn, target, opts), { once: true }));
+}
+
+function answerCountry(btn, target, opts) {
+  const { mode } = quiz;
+  const correct = btn.dataset.id === target.id;
+  const buttons = $("#quiz-body").querySelectorAll(".answer");
+  buttons.forEach((b) => { b.disabled = true; if (b.dataset.id === target.id) b.classList.add("correct"); });
+  if (!correct) {
+    btn.classList.add("wrong");
+    if (mode.flagAnswers) {
+      buttons.forEach((b) => {
+        const c = opts.find((o) => o.id === b.dataset.id);
+        b.insertAdjacentHTML("beforeend", `<span class="hint">${esc(c.name)}</span>`);
+      });
+    }
+  }
+  saveRec(mode.id, target.id, correct);
+  const chosen = opts.find((o) => o.id === btn.dataset.id);
+  settle({
+    correct,
+    show: { icon: target.flag, title: target.name, sub: mode.id.startsWith("capital") ? "Stolica: " + target.capital : "Twój wybór: " + chosen.name },
+    feedback: correct ? "" : `<p>Poprawna odpowiedź: <strong>${esc(mode.answerText(target))}</strong></p>`,
+  });
+}
+
+/* ---------- Karte ---------- */
+function renderMap(target) {
+  const view = region === "Wszystkie" ? target.region : region;
+  const v = MAPD.views[view] || MAPD.views.Wszystkie;
+  $("#quiz-body").innerHTML = `
+    <div class="prompt tight"><p class="prompt-label">Wskaż</p><h2 class="prompt-big small">${esc(target.name)}</h2></div>
+    <div class="mapbox"><svg id="quiz-map" viewBox="${v.join(" ")}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Mapa">${MAP_MARKUP}</svg></div>
+    <p class="map-tip">Widok: ${view}</p>
+    ${FEEDBACK}`;
+  const svg = $("#quiz-map");
+  let locked = false;
+  svg.addEventListener("click", (e) => {
+    const p = e.target.closest("path.land:not(.bg)");
+    if (!p || locked) return;
+    locked = true;
+    const id = p.dataset.id;
+    const correct = id === target.id;
+    p.classList.add(correct ? "ok" : "no");
+    const right = svg.querySelector(`path[data-id="${target.id}"]`);
+    if (!correct && right) { right.classList.add("ok"); svg.appendChild(right); }
+    svg.appendChild(p);
+    saveRec("map", target.id, correct);
+    settle({
+      correct,
+      show: { icon: target.flag, title: target.name, sub: correct ? "" : `Wybrano: ${nameOf(id)}` },
+      feedback: correct ? "" : `<p>To jest <strong>${esc(nameOf(id))}</strong>. Szukano: <strong>${esc(target.name)}</strong>.</p>`,
+    });
+  });
+}
+
+/* ---------- Wahr oder falsch ---------- */
+function renderTF(f) {
+  $("#quiz-body").innerHTML = `
+    <div class="prompt"><p class="prompt-label">Prawda czy fałsz?</p><h2 class="prompt-statement">${esc(f.s)}</h2></div>
+    <div class="answers two"><button class="answer" data-v="1">Prawda</button><button class="answer" data-v="0">Fałsz</button></div>
+    ${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+    const correct = (btn.dataset.v === "1") === f.a;
+    $("#quiz-body").querySelectorAll(".answer").forEach((b) => {
+      b.disabled = true;
+      if ((b.dataset.v === "1") === f.a) b.classList.add("correct");
+    });
+    if (!correct) btn.classList.add("wrong");
+    saveRec("tf", f.id, correct);
+    settle({
+      correct, auto: false,
+      show: { icon: f.a ? "✓" : "✗", title: f.s, sub: f.e },
+      feedback: `<p><strong>${f.a ? "Prawda" : "Fałsz"}.</strong> ${esc(f.e)}</p>`,
+    });
+  }, { once: true }));
+}
+
+/* ---------- Früher oder später? ---------- */
+function renderBefore([a, b]) {
+  $("#quiz-body").innerHTML = `
+    <div class="prompt short"><p class="prompt-label">Co wydarzyło się wcześniej?</p></div>
+    <div class="answers">
+      <button class="answer" data-i="0">${esc(a.t)}<span class="hint"></span></button>
+      <button class="answer" data-i="1">${esc(b.t)}<span class="hint"></span></button>
+    </div>${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+    const first = a.y < b.y ? 0 : 1;
+    const correct = Number(btn.dataset.i) === first;
+    const btns = [...$("#quiz-body").querySelectorAll(".answer")];
+    btns.forEach((x, i) => { x.disabled = true; x.querySelector(".hint").textContent = fmtYear((i ? b : a).y); if (i === first) x.classList.add("correct"); });
+    if (!correct) btn.classList.add("wrong");
+    const early = first ? b : a;
+    settle({
+      correct, delay: 1500,
+      show: { icon: "✗", title: `${a.t} czy ${b.t}`, sub: `${fmtYear(a.y)} i ${fmtYear(b.y)}` },
+      feedback: correct ? "" : `<p>Wcześniej było: <strong>${esc(early.t)}</strong> (${fmtYear(early.y)})</p>`,
+    });
+  }, { once: true }));
+}
+
+/* ---------- Jahr schätzen ---------- */
+function renderYear(e) {
+  $("#quiz-body").innerHTML = `
+    <div class="prompt"><p class="prompt-label">W którym roku to się wydarzyło?</p><h2 class="prompt-statement">${esc(e.t)}</h2></div>
+    <div class="year-row">
+      <input id="yr" type="number" inputmode="numeric" placeholder="Rok" aria-label="Rok">
+      <button class="lang-btn" id="era" type="button" data-bc="0">n.e.</button>
+    </div>
+    <button class="btn wide" id="check">Sprawdź</button>
+    ${FEEDBACK}`;
+  const input = $("#yr"), era = $("#era"), check = $("#check");
+  era.addEventListener("click", () => {
+    const bc = era.dataset.bc === "1" ? "0" : "1";
+    era.dataset.bc = bc;
+    era.textContent = bc === "1" ? "p.n.e." : "n.e.";
+  });
+  const submit = () => {
+    const raw = parseInt(input.value, 10);
+    if (Number.isNaN(raw) || check.disabled) return;
+    const guess = era.dataset.bc === "1" ? -Math.abs(raw) : Math.abs(raw);
+    const err = Math.abs(guess - e.y);
+    const tol = Math.max(3, Math.round(Math.abs(THIS_YEAR - e.y) * 0.04));
+    const correct = err <= tol;
+    const pts = Math.max(0, Math.round(100 * (1 - err / (tol * 4))));
+    input.disabled = true; era.disabled = true; check.disabled = true; check.hidden = true;
+    settle({
+      correct, auto: false, pts,
+      show: { icon: correct ? "✓" : "✗", title: e.t, sub: `Poprawnie: ${fmtYear(e.y)}, Twój typ: ${fmtYear(guess)}` },
+      feedback: `<p><strong>${fmtYear(e.y)}</strong><br>${err === 0 ? "Dokładnie w ten rok!" : `${err} ${plural(err, ["rok", "lata", "lat"])} różnicy`} · ${pts} ${plural(pts, ["punkt", "punkty", "punktów"])}</p>`,
+    });
+  };
+  check.addEventListener("click", submit);
+  input.addEventListener("keydown", (ev) => { if (ev.key === "Enter") submit(); });
+}
+
+/* ---------- Zeitstrahl ---------- */
+function renderTimeline(set) {
+  const order = [];
+  const shuffled = shuffle(set);
+  let finished = false;
+  $("#quiz-body").innerHTML = `
+    <div class="prompt short"><p class="prompt-label">Wskazuj wydarzenia po kolei: najstarsze pierwsze.</p></div>
+    <div class="tl" id="tl"></div>
+    <div class="tl-actions"><button class="btn ghost" id="undo" type="button">Cofnij ostatni wybór</button></div>
+    ${FEEDBACK}`;
+  const draw = () => {
+    $("#tl").innerHTML = shuffled.map((ev) => {
+      const k = order.indexOf(ev.id);
+      return `<button class="tl-item${k >= 0 ? " picked" : ""}" data-id="${ev.id}" ${k >= 0 || finished ? "disabled" : ""}>
+        ${k >= 0 ? `<b class="tl-badge">${k + 1}</b>` : `<b class="tl-badge empty"></b>`}<span>${esc(ev.t)}</span></button>`;
+    }).join("");
+    $("#undo").disabled = finished || order.length === 0;
+  };
+  draw();
+  $("#tl").addEventListener("click", (e) => {
+    const b = e.target.closest(".tl-item");
+    if (!b || finished) return;
+    order.push(b.dataset.id);
+    if (order.length < set.length) { draw(); return; }
+    finished = true;
+    draw();
+    $("#undo").hidden = true;
+    const sorted = [...set].sort((x, y) => x.y - y.y);
+    const right = order.filter((id, i) => id === sorted[i].id).length;
+    const correct = right === set.length;
+    settle({
+      correct, auto: false,
+      show: { icon: correct ? "✓" : "✗", title: "Oś czasu", sub: `${right} z ${set.length} na właściwym miejscu` },
+      feedback: `<div class="fb-text"><p><strong>${right} z ${set.length}</strong> na właściwym miejscu.</p>
+        <ol class="tl-result">${sorted.map((ev, i) => `<li class="${order[i] === ev.id ? "ok" : "no"}"><b>${fmtYear(ev.y)}</b> ${esc(ev.t)}</li>`).join("")}</ol></div>`,
+      after: () => { const qb = $("#quiz-body"); qb.scrollTop = qb.scrollHeight; },
+    });
+  });
+  $("#undo").addEventListener("click", () => { if (!finished) { order.pop(); draw(); } });
+}
+
+/* ---------- Die Akte (früher „Wer war das?“) ---------- */
+const discovered = () => store.get("people", []);
+function discover(id) {
+  const list = discovered();
+  if (!list.includes(id)) { list.push(id); store.set("people", list); }
+}
+
+const PHOTO_MIN = 8; // erst ab so vielen Porträts werden Foto-Spiele angeboten
+const hasPhotos = () => Object.keys(PORTRAITS).length >= PHOTO_MIN;
+const photoUrl = (id) => { const r = PORTRAITS[id]; return r ? `${r.file}?v=${r.v}` : null; };
+function preloadPhotos(people) { people.forEach((p) => { const u = photoUrl(p.id); if (u) new Image().src = u; }); }
+
+const SILHOUETTE = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8.5" r="4"/><path d="M4.5 20c.8-4 3.8-6 7.5-6s6.7 2 7.5 6"/></svg>';
+
+// Runder oder quadratischer Ausschnitt (Initialen, solange kein Foto da ist)
+function avatar(p, cls = "") {
+  const u = photoUrl(p.id);
+  return `<span class="avatar ${cls}" aria-hidden="true">${u ? `<img src="${esc(u)}" alt="" loading="lazy" onerror="this.remove()">` : ""}<span class="ini">${esc(initials(p.name))}</span></span>`;
+}
+
+// Großes Porträt; bei blur > 0 ist es verschwommen (Akte), Silhouette wenn kein Foto vorhanden ist
+function portraitHTML(p, { blur = 0, stamp = "", id = "", big = false } = {}) {
+  const u = photoUrl(p.id);
+  return `<div class="portrait${u ? "" : " nophoto"}${big ? " big" : ""}"${id ? ` id="${id}"` : ""}>
+    ${u ? `<img src="${esc(u)}" alt="" style="--blur:${blur}px" onerror="this.parentNode.classList.add('nophoto');this.remove()">` : ""}
+    <span class="silhouette">${SILHOUETTE}</span>${stamp ? `<span class="stamp">${esc(stamp)}</span>` : ""}</div>`;
+}
+
+function lifeBar(p) {
+  const min = -800, max = THIS_YEAR, span = max - min;
+  const pct = (y) => ((Math.max(min, Math.min(max, y)) - min) / span) * 100;
+  const left = pct(p.b), width = Math.max(1.5, pct(p.d) - pct(p.b));
+  const tick = (y, label) => `<span style="left:${pct(y)}%">${label}</span>`;
+  return `<div class="lifebar" role="img" aria-label="Czas życia ${esc(lifeSpan(p))}">
+    <div class="track"><i style="left:${left}%;width:${width}%"></i></div>
+    <div class="ticks">${tick(-800, "800 p.n.e.")}${tick(0, "0")}${tick(1000, "1000")}${tick(max, "dziś")}</div></div>`;
+}
+
+function steckbriefHTML(p) {
+  return `<h2 class="profile-name">${esc(p.name)}</h2>
+    <p class="profile-meta">${esc(p.role)}<br>${lifeSpan(p)}</p>
+    ${lifeBar(p)}
+    <p class="profile-tags"><span class="cat">${ERA_LABEL[p.era]}</span><span class="cat">${PTOPIC_LABEL[p.topic]}</span></p>
+    <h3>W skrócie</h3><p>${esc(p.short)}</p>
+    <h3>Tło</h3><p>${esc(p.bg)}</p>`;
+}
+
+/* Schwierigkeit passt sich automatisch an den Lernstand (Kasten) an */
+const AKTE_FIELDS = [
+  { key: "era", label: "Epoka", val: (p) => ERA_LABEL[p.era] },
+  { key: "country", label: "Kraj", val: (p) => p.country },
+  { key: "life", label: "Daty życia", val: (p) => lifeSpan(p) },
+  { key: "role", label: "Zawód", val: (p) => p.role },
+  { key: "known", label: "Znany z", val: (p) => p.known },
+  { key: "hint", label: "Osobista wskazówka", val: (p) => p.hints[2] },
+];
+const AKTE_LEVELS = {
+  1: { label: "Łatwy", blur: 10, open: ["era", "country"], dist: "far" },
+  2: { label: "Średni", blur: 16, open: ["era"], dist: "topic" },
+  3: { label: "Trudny", blur: 22, open: [], dist: "near" },
+};
+function whoLevel(p) {
+  const r = rec("who", p.id);
+  if (!r) return 1;
+  return r.box <= 1 ? 1 : r.box <= 3 ? 2 : 3;
+}
+
+// Neue Personen lernt man zuerst kennen (Steckbrief, dann Mini-test), höchstens drei pro Runde. Der Rest kommt als Akte.
+function pickWho(n = 10) {
+  const picked = pickFrom("who", CONTENT.people, n);
+  let learn = 0;
+  return picked.map((p) => {
+    if (!rec("who", p.id) && learn < 3) { learn++; return { p, mode: "learn" }; }
+    return { p, mode: "akte", level: whoLevel(p) };
+  });
+}
+
+function whoOptions(p, dist = "topic") {
+  const others = CONTENT.people.filter((x) => x.id !== p.id);
+  let pool;
+  if (dist === "far") pool = others.filter((x) => x.topic !== p.topic && x.era !== p.era);
+  else if (dist === "near") pool = others.filter((x) => x.topic === p.topic).sort((a, b) => Math.abs(a.b - p.b) - Math.abs(b.b - p.b)).slice(0, 8);
+  else pool = others.filter((x) => x.topic === p.topic);
+  const rest = others.filter((x) => !pool.includes(x));
+  return shuffle([p, ...[...shuffle(pool), ...shuffle(rest)].slice(0, 3)]);
+}
+
+// Ergebnis festhalten, ohne automatisch weiterzuschalten
+function record({ correct, show, pts = 0 }) {
+  quiz.results[quiz.i] = { correct, show, pts };
+  quiz.points += pts;
+  renderDots();
+}
+
+// Mini-test: eine Frage zur Leistung der Person
+function renderMiniCheck(p, onAnswer) {
+  const opts = shuffle(p.qa.o.map((t, i) => ({ t, ok: i === 0 })));
+  $("#quiz-body").innerHTML = `
+    <div class="mini-head">${avatar(p, "sm")}<span><strong>${esc(p.name)}</strong><span class="muted">Mini-test</span></span></div>
+    <div class="prompt tight"><h2 class="prompt-statement">${esc(p.qa.q)}</h2></div>
+    <div class="answers">${opts.map((o, i) => `<button class="answer" data-i="${i}">${esc(o.t)}</button>`).join("")}</div>
+    ${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+    const correct = opts[Number(btn.dataset.i)].ok;
+    $("#quiz-body").querySelectorAll(".answer").forEach((b, i) => { b.disabled = true; if (opts[i].ok) b.classList.add("correct"); });
+    if (!correct) btn.classList.add("wrong");
+    onAnswer(correct);
+    $("#feedback").innerHTML = `<p>${correct ? "Dobrze." : `Poprawna odpowiedź: <strong>${esc(p.qa.o[0])}</strong>`}</p><button class="btn" id="next">Dalej</button>`;
+    $("#next").addEventListener("click", next);
+  }, { once: true }));
+}
+
+// Neue Person: erst kennenlernen, dann Mini-test
+function renderLearnCard({ p }) {
+  discover(p.id);
+  $("#quiz-body").innerHTML = `
+    <div class="profile learn">
+      ${portraitHTML(p, { stamp: "Nowa", big: true })}
+      ${steckbriefHTML(p)}
+    </div>
+    <div class="card-actions"><button class="btn wide" id="to-check" type="button">Dalej do mini-testu</button></div>`;
+  $("#to-check").addEventListener("click", () => renderMiniCheck(p, (correct) => {
+    saveRec("who", p.id, correct);
+    record({ correct, pts: correct ? 3 : 0, show: { icon: initials(p.name), title: p.name, sub: "nowo poznana" } });
+  }));
+}
+
+// Bekannte Person: Akte mit geschwärzten Feldern, das Foto wird mit jedem aufgedeckten Feld schärfer
+function renderAkte({ p, level }) {
+  const L = AKTE_LEVELS[level];
+  const opts = whoOptions(p, L.dist);
+  const open = new Set(L.open);
+  const wasUnseen = !rec("who", p.id);
+  let paid = 0, wrong = 0, done = false;
+  $("#quiz-body").innerHTML = `
+    <div class="akte">
+      ${portraitHTML(p, { blur: L.blur, stamp: L.label, id: "akte-portrait" })}
+      <div class="akte-side">
+        <p class="akte-name" id="akte-name">Nieznana osoba</p>
+        <p class="muted akte-rule">Każde odkryte pole kosztuje punkt. Błędny typ odkrywa jedno pole, przy drugim błędzie sprawa jest przegrana.</p>
+      </div>
+    </div>
+    <div class="fields" id="fields"></div>
+    <div class="answers" id="who-opts">${opts.map((o) => `<button class="answer" data-id="${o.id}">${esc(o.name)}</button>`).join("")}</div>
+    ${FEEDBACK}`;
+  const portrait = $("#akte-portrait");
+  portrait.classList.add("hidden");
+  const img = portrait.querySelector("img");
+  const paintBlur = () => img?.style.setProperty("--blur", `${Math.max(0, L.blur * (1 - paid / 4))}px`);
+  const draw = () => {
+    $("#fields").innerHTML = AKTE_FIELDS.map((f) => open.has(f.key)
+      ? `<div class="field open"><span class="f-label">${f.label}</span><span class="f-val">${esc(f.val(p))}</span></div>`
+      : `<button class="field locked" data-key="${f.key}" type="button"><span class="f-label">${f.label}</span><span class="f-val redact">▮▮▮▮▮▮▮▮▮▮</span><span class="f-cost">−1</span></button>`).join("");
+  };
+  const reveal = (key) => { if (done || open.has(key)) return; open.add(key); paid++; draw(); paintBlur(); };
+  draw();
+  $("#fields").addEventListener("click", (e) => { const b = e.target.closest(".field.locked"); if (b) reveal(b.dataset.key); });
+
+  const finish = (correct) => {
+    done = true;
+    $("#who-opts").querySelectorAll(".answer").forEach((x) => { x.disabled = true; if (x.dataset.id === p.id) x.classList.add("correct"); });
+    portrait.classList.remove("hidden");
+    img?.style.setProperty("--blur", "0px");
+    const pts = correct ? Math.max(1, 5 - paid) + (level - 1) : 0;
+    saveRec("who", p.id, correct && paid <= 3);
+    discover(p.id);
+    record({ correct, pts, show: { icon: initials(p.name), title: p.name, sub: correct ? `odkryto ${paid} ${plural(paid, ["pole", "pola", "pól"])}` : "nierozpoznana" } });
+    const needsCheck = !correct || wasUnseen;
+    $("#akte-name").textContent = p.name;
+    $(".akte-rule").textContent = `${p.role} · ${lifeSpan(p)}`;
+    $("#fields").innerHTML = `${lifeBar(p)}<p class="sol-short">${esc(p.short)}</p>`;
+    $("#who-opts").hidden = true;
+    $("#feedback").innerHTML = `<p><strong>${correct ? `${pts} ${plural(pts, ["punkt", "punkty", "punktów"])}` : "Sprawa przegrana"}</strong><br><span class="muted">${correct ? "Rozwiązane:" : "Ta osoba to"} ${esc(p.name)}</span></p>
+      <button class="btn ghost" id="open-profile" type="button">Profil</button>
+      <button class="btn" id="to-check" type="button">${needsCheck ? "Mini-test" : "Dalej"}</button>`;
+    $("#open-profile").addEventListener("click", () => openProfile(p.id));
+    $("#to-check").addEventListener("click", () => (needsCheck ? renderMiniCheck(p, () => {}) : next()));
+  };
+  $("#who-opts").addEventListener("click", (e) => {
+    const b = e.target.closest(".answer");
+    if (!b || done || b.disabled) return;
+    if (b.dataset.id === p.id) return finish(true);
+    b.classList.add("wrong"); b.disabled = true;
+    wrong++;
+    if (wrong >= 2) return finish(false);
+    const nextField = AKTE_FIELDS.find((f) => !open.has(f.key));
+    if (nextField) reveal(nextField.key);
+  });
+}
+
+/* ---------- Gesichter: Porträt sehen, Person wählen ---------- */
+function renderFace(p) {
+  const opts = whoOptions(p, "topic");
+  $("#quiz-body").innerHTML = `
+    <div class="prompt tight"><p class="prompt-label">Kto to jest?</p></div>
+    ${portraitHTML(p, { big: true })}
+    <div class="answers">${opts.map((o) => `<button class="answer" data-id="${o.id}">${esc(o.name)}</button>`).join("")}</div>
+    ${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+    const correct = btn.dataset.id === p.id;
+    $("#quiz-body").querySelectorAll(".answer").forEach((b) => { b.disabled = true; if (b.dataset.id === p.id) b.classList.add("correct"); });
+    if (!correct) btn.classList.add("wrong");
+    saveRec("face", p.id, correct);
+    discover(p.id);
+    settle({
+      correct,
+      show: { icon: initials(p.name), title: p.name, sub: lifeSpan(p) },
+      feedback: correct ? "" : `<p>To była osoba: <strong>${esc(p.name)}</strong><br><span class="muted">${esc(p.role)}</span></p>`,
+    });
+  }, { once: true }));
+}
+
+/* ---------- Verbindungsnetz ---------- */
+const NEIGH = {}; // id -> [{ to, w }]
+function buildGraph() {
+  for (const k of Object.keys(NEIGH)) delete NEIGH[k];
+  CONTENT.edges.forEach(({ a, b, w }) => {
+    (NEIGH[a] ??= []).push({ to: b, w });
+    (NEIGH[b] ??= []).push({ to: a, w });
+  });
+}
+function distFrom(src) {
+  const d = { [src]: 0 }, q = [src];
+  for (let i = 0; i < q.length; i++) {
+    for (const { to } of NEIGH[q[i]] || []) if (!(to in d)) { d[to] = d[q[i]] + 1; q.push(to); }
+  }
+  return d;
+}
+const edgeWhy = (a, b) => (NEIGH[a] || []).find((n) => n.to === b)?.w || "";
+function shortestPath(a, b) {
+  const prev = { [a]: null }, q = [a];
+  for (let i = 0; i < q.length && !(b in prev); i++) {
+    for (const { to } of NEIGH[q[i]] || []) if (!(to in prev)) { prev[to] = q[i]; q.push(to); }
+  }
+  const path = [];
+  for (let c = b; c != null; c = prev[c]) path.unshift(c);
+  return path;
+}
+
+/* ---------- Zeitgenossen-Duell ---------- */
+const DUEL_BORN_GAP = 25, DUEL_ODD_GAP = 40;
+function pickDuels(n = 10) {
+  const P = CONTENT.people, out = [];
+  for (let guard = 0; out.length < n && guard < 600; guard++) {
+    if (Math.random() < 0.5) {
+      const [a, b] = shuffle(P).slice(0, 2);
+      if (Math.abs(a.b - b.b) < DUEL_BORN_GAP) continue;
+      out.push({ type: "born", people: [a, b], answer: (a.b < b.b ? a : b).id });
+    } else {
+      const y = P[Math.floor(Math.random() * P.length)].b + 20;
+      const alive = shuffle(P.filter((p) => p.b <= y && y <= p.d));
+      if (alive.length < 3) continue;
+      const three = alive.slice(0, 3);
+      const lo = Math.min(...three.map((p) => p.b)), hi = Math.max(...three.map((p) => p.d));
+      const far = P.filter((p) => p.d < lo - DUEL_ODD_GAP || p.b > hi + DUEL_ODD_GAP);
+      if (!far.length) continue;
+      const odd = far[Math.floor(Math.random() * far.length)];
+      out.push({ type: "odd", people: shuffle([...three, odd]), answer: odd.id });
+    }
+  }
+  return out;
+}
+
+// Lebenszeiten als Balken auf gemeinsamer Zeitachse
+function rangeChart(list, markId) {
+  const lo = Math.min(...list.map((p) => p.b)) - 10, hi = Math.max(...list.map((p) => p.d)) + 10, span = hi - lo;
+  return `<div class="range">${list.slice().sort((a, b) => a.b - b.b).map((p) => `
+    <div class="r-row${p.id === markId ? " mark" : ""}">
+      <span class="r-name">${esc(p.name)}</span>
+      <div class="r-track"><i style="left:${((p.b - lo) / span) * 100}%;width:${Math.max(1.5, ((p.d - p.b) / span) * 100)}%"></i></div>
+      <span class="r-years">${lifeSpan(p)}</span>
+    </div>`).join("")}</div>`;
+}
+
+function renderDuel(q) {
+  const born = q.type === "born";
+  $("#quiz-body").innerHTML = `
+    <div class="prompt short"><p class="prompt-label">${born ? "Kto urodził się wcześniej?" : "Troje z nich żyło w tym samym czasie. Kto do nich nie pasuje?"}</p></div>
+    <div class="duel${born ? " two" : ""}">
+      ${q.people.map((p) => `<button class="duel-card" data-id="${p.id}" type="button">${avatar(p, "sq")}<span class="t-name">${esc(p.name)}</span></button>`).join("")}
+    </div>${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".duel-card").forEach((btn) => btn.addEventListener("click", () => {
+    const correct = btn.dataset.id === q.answer;
+    const ans = PEOPLE[q.answer];
+    $("#quiz-body").querySelectorAll(".duel-card").forEach((b) => {
+      b.disabled = true;
+      if (b.dataset.id === q.answer) b.classList.add("correct");
+    });
+    if (!correct) btn.classList.add("wrong");
+    const text = born
+      ? `Wcześniej urodziła się osoba: <strong>${esc(ans.name)}</strong>.`
+      : `Osoba <strong>${esc(ans.name)}</strong> żyła w zupełnie innej epoce niż pozostała trójka.`;
+    settle({
+      correct, auto: false,
+      show: { icon: born ? "↔" : "≠", title: q.people.map((p) => p.name).join(", "), sub: born ? `Wcześniej urodzona osoba: ${ans.name}` : `Nie pasuje: ${ans.name}` },
+      feedback: `<div class="fb-text"><p>${text}</p>${rangeChart(q.people, q.answer)}</div>`,
+    });
+  }, { once: true }));
+}
+
+/* ---------- Zitat-Rätsel ---------- */
+function renderQuote(item) {
+  const p = PEOPLE[item.p];
+  const opts = whoOptions(p, "topic");
+  $("#quiz-body").innerHTML = `
+    <div class="prompt"><p class="prompt-label">Kto jest autorem tego cytatu?</p>
+      <blockquote class="quote">„${esc(item.q)}”</blockquote></div>
+    <div class="answers">${opts.map((o) => `<button class="answer" data-id="${o.id}">${esc(o.name)}</button>`).join("")}</div>
+    ${FEEDBACK}`;
+  $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+    const correct = btn.dataset.id === p.id;
+    $("#quiz-body").querySelectorAll(".answer").forEach((b) => { b.disabled = true; if (b.dataset.id === p.id) b.classList.add("correct"); });
+    if (!correct) btn.classList.add("wrong");
+    saveRec("quote", item.id, correct);
+    discover(p.id);
+    settle({
+      correct, auto: false,
+      show: { icon: initials(p.name), title: `„${item.q}”`, sub: p.name },
+      feedback: `<div class="fb-text"><p><strong>${esc(p.name)}</strong><br><span class="muted">${esc(item.s)}</span></p>
+        ${item.t ? '<p class="muted small">Przekazywane: dokładne brzmienie nie jest potwierdzone.</p>' : ""}</div>
+        <button class="btn ghost" id="open-profile" type="button">Profil</button>`,
+      after: () => $("#open-profile").addEventListener("click", () => openProfile(p.id)),
+    });
+  }, { once: true }));
+}
+
+/* ---------- Verbindungen: Weg von Person A zu Person B ---------- */
+function pickRoutes(n = 5) {
+  const ids = CONTENT.people.map((p) => p.id), out = [], used = new Set();
+  for (let guard = 0; out.length < n && guard < 400; guard++) {
+    const a = ids[Math.floor(Math.random() * ids.length)];
+    if (used.has(a)) continue;
+    const d = distFrom(a);
+    const cands = ids.filter((b) => d[b] >= 2 && d[b] <= 4 && !used.has(b));
+    if (!cands.length) continue;
+    const b = cands[Math.floor(Math.random() * cands.length)];
+    used.add(a); used.add(b);
+    out.push({ a, b, opt: d[b] });
+  }
+  return out;
+}
+
+function renderLinks({ a, b, opt }) {
+  const A = PEOPLE[a], B = PEOPLE[b];
+  const toGoal = distFrom(b);               // Abstand jeder Person zum Ziel
+  const path = [a];
+  const limit = opt + 3;
+  const chain = () => path.map((id) => `<span class="stop">${esc(PEOPLE[id].name)}</span>`).join('<span class="arrow">→</span>');
+  const summary = (ids) => `<ol class="tl-result">${ids.slice(1).map((id, i) => `<li><b>${esc(PEOPLE[ids[i]].name)} → ${esc(PEOPLE[id].name)}</b><br>${esc(edgeWhy(ids[i], id))}</li>`).join("")}</ol>`;
+
+  const draw = () => {
+    const cur = path[path.length - 1];
+    const seen = new Set(path);
+    let options = (NEIGH[cur] || []).map((n) => n.to).filter((id) => !seen.has(id));
+    if (options.length < 2) options = (NEIGH[cur] || []).map((n) => n.to);
+    const good = shuffle(options.filter((id) => toGoal[id] < toGoal[cur]));
+    const rest = shuffle(options.filter((id) => !(toGoal[id] < toGoal[cur])));
+    const shown = shuffle([...good.slice(0, 2), ...rest.slice(0, 5 - Math.min(2, good.length)), ...good.slice(2, 3)].slice(0, 5));
+    if (toGoal[cur] === 1 && !shown.includes(b)) shown[0] = b;
+    const steps = path.length - 1;
+    $("#quiz-body").innerHTML = `
+      <div class="prompt short"><p class="prompt-label">Znajdź drogę przez powiązane osoby. Kroki: ${steps} · cel osiągalny w ${opt}</p></div>
+      <div class="route"><div class="route-goal"><span class="muted">Start</span><strong>${esc(A.name)}</strong></div><span class="arrow">→</span><div class="route-goal"><span class="muted">Cel</span><strong>${esc(B.name)}</strong></div></div>
+      <div class="chain">${chain()}</div>
+      <p class="prompt-label hop">Z kim powiązana jest osoba <strong>${esc(PEOPLE[cur].name)}</strong>?</p>
+      <div class="answers" id="hop-opts">${shown.map((id) => `<button class="answer" data-id="${id}">${esc(PEOPLE[id].name)}<span class="hint">${esc(PEOPLE[id].role)}</span></button>`).join("")}</div>
+      ${FEEDBACK}`;
+    $("#hop-opts").addEventListener("click", (e) => {
+      const btn = e.target.closest(".answer");
+      if (!btn || btn.disabled) return;
+      step(btn.dataset.id, cur, btn);
+    });
+  };
+
+  const step = (id, cur, btn) => {
+    const before = toGoal[cur], after = toGoal[id];
+    $("#hop-opts").querySelectorAll(".answer").forEach((x) => { x.disabled = true; });
+    btn.classList.add(after < before ? "correct" : after > before ? "wrong" : "neutral");
+    path.push(id);
+    const mood = after < before ? "Bliżej celu" : after > before ? "Objazd" : "Tak samo daleko";
+    const why = esc(edgeWhy(cur, id));
+    const steps = path.length - 1;
+    if (id === b || steps >= limit) $("#hop-opts").hidden = true;
+    if (id === b) {
+      const pts = Math.max(1, 6 - 2 * (steps - opt));
+      record({ correct: steps <= opt + 1, pts, show: { icon: "🕸", title: `${A.name} → ${B.name}`, sub: `${steps} ${plural(steps, ["krok", "kroki", "kroków"])}, najkrótsza droga: ${opt}` } });
+      $("#feedback").innerHTML = `<div class="fb-text"><p><strong>Cel osiągnięty w ${steps} ${plural(steps, ["kroku", "krokach", "krokach"])}</strong> (najkrótsza droga: ${opt}) · ${pts} ${plural(pts, ["punkt", "punkty", "punktów"])}</p>${summary(path)}</div><button class="btn" id="next" type="button">Dalej</button>`;
+      $("#next").addEventListener("click", next);
+      return;
+    }
+    if (steps >= limit) {
+      const best = shortestPath(a, b);
+      record({ correct: false, pts: 0, show: { icon: "🕸", title: `${A.name} → ${B.name}`, sub: `zbyt wiele objazdów, najkrótsza droga: ${opt}` } });
+      $("#feedback").innerHTML = `<div class="fb-text"><p><strong>Zbyt wiele objazdów.</strong> Jedna z najkrótszych dróg:</p>${summary(best)}</div><button class="btn" id="next" type="button">Dalej</button>`;
+      $("#next").addEventListener("click", next);
+      return;
+    }
+    $("#feedback").innerHTML = `<div class="fb-text"><p><strong>${mood}.</strong><br>${why}</p></div><button class="btn" id="step-on" type="button">Dalej</button>`;
+    $("#step-on").addEventListener("click", draw);
+  };
+  draw();
+}
+
+/* ---------- Profile und Atlas (Overlay) ---------- */
+const sheetStack = [];
+function openSheet(render) {
+  sheetStack.push(render);
+  $("#sheet").hidden = false;
+  document.body.style.overflow = "hidden";
+  render();
+  $("#sheet-body").scrollTop = 0;
+}
+function sheetBack() {
+  sheetStack.pop();
+  if (sheetStack.length) { sheetStack[sheetStack.length - 1](); return; }
+  $("#sheet").hidden = true;
+  document.body.style.overflow = $("#quiz").hidden ? "" : "hidden";
+  renderLearn();
+}
+$("#sheet-back").addEventListener("click", sheetBack);
+const openProfile = (id) => openSheet(() => profileView(id));
+
+function profileView(id) {
+  const p = PEOPLE[id];
+  discover(id);
+  $("#sheet-title").textContent = "Profil";
+  const rel = (NEIGH[id] || []).map((n) => ({ p: PEOPLE[n.to], w: n.w })).filter((r) => r.p);
+  const ph = PORTRAITS[id];
+  $("#sheet-body").innerHTML = `
+    <div class="profile">
+      ${portraitHTML(p, { big: true })}
+      ${steckbriefHTML(p)}
+      ${ph ? `<p class="credit">Zdjęcie: ${esc(ph.artist)}, ${esc(ph.license)}, <a href="${esc(ph.page)}" target="_blank" rel="noopener">Wikimedia Commons</a></p>` : ""}
+      <h3>Odkrywaj dalej</h3>
+      <div class="rabbit">${rel.map((r) => `<button class="atlas-row" data-id="${r.p.id}">${avatar(r.p, "sm")}<span><strong>${esc(r.p.name)}</strong><span class="muted why">${esc(r.w)}</span></span></button>`).join("")}</div>
+      <a class="btn ghost wide wiki" href="https://pl.wikipedia.org/w/index.php?search=${encodeURIComponent(p.name)}" target="_blank" rel="noopener">Czytaj w Wikipedii</a>
+    </div>`;
+  $("#sheet-body").querySelectorAll(".rabbit .atlas-row").forEach((b) => b.addEventListener("click", () => openProfile(b.dataset.id)));
+}
+
+// Personen-Album: Porträts pro Epoche oder Thema, unbekannte Personen bleiben ein Fragezeichen
+let atlasBy = "era";
+function atlasView() {
+  $("#sheet-title").textContent = "Album postaci";
+  const seen = new Set(discovered());
+  const all = CONTENT.people;
+  const groups = atlasBy === "era"
+    ? Object.entries(ERA_LABEL).map(([k, label]) => [label, all.filter((p) => p.era === k)])
+    : Object.entries(PTOPIC_LABEL).map(([k, label]) => [label, all.filter((p) => p.topic === k)]);
+  $("#sheet-body").innerHTML = `
+    <p class="page-sub">Odkryto ${seen.size} z ${all.length} postaci. Nowe postacie znajdziesz w „Teczce” i w „Twarzach”.</p>
+    <div class="segmented two" role="tablist" aria-label="Sortowanie">
+      <button role="tab" data-by="era" aria-selected="${atlasBy === "era"}">Według epoki</button>
+      <button role="tab" data-by="topic" aria-selected="${atlasBy === "topic"}">Według tematu</button>
+    </div>
+    ${groups.map(([label, list]) => {
+      const sorted = list.slice().sort((a, b) => a.b - b.b);
+      const mine = sorted.filter((p) => seen.has(p.id)).length;
+      return `<h3 class="atlas-group">${label} <span class="muted">${mine}/${list.length}</span></h3>
+        <div class="grid">${sorted.map((p) => seen.has(p.id)
+          ? `<button class="tile" data-id="${p.id}">${avatar(p, "sq")}<span class="t-name">${esc(p.name)}</span></button>`
+          : `<div class="tile locked" aria-label="jeszcze nieznana"><span class="avatar sq"><span class="ini">?</span></span><span class="t-name">???</span></div>`).join("")}</div>`;
+    }).join("")}`;
+  $("#sheet-body").querySelectorAll(".tile[data-id]").forEach((b) => b.addEventListener("click", () => openProfile(b.dataset.id)));
+  $("#sheet-body").querySelectorAll("[data-by]").forEach((b) => b.addEventListener("click", () => { atlasBy = b.dataset.by; atlasView(); }));
+}
+
+/* ---------- Tagesstapel ---------- */
+const DECK_SIZE = 10;
+function buildDeck() {
+  const now = Date.now();
+  const cards = CONTENT.cards;
+  const due = shuffle(cards.filter((c) => { const r = rec("cards", c.id); return r && r.box < 5 && r.due <= now; }))
+    .sort((a, b) => rec("cards", a.id).box - rec("cards", b.id).box).slice(0, 4);
+  const fresh = shuffle(cards.filter((c) => !rec("cards", c.id)));
+  const rest = shuffle(cards.filter((c) => !due.includes(c) && !fresh.includes(c)))
+    .sort((a, b) => rec("cards", a.id).due - rec("cards", b.id).due);
+  const out = [...due];
+  for (const list of [fresh, rest]) for (const c of list) if (out.length < DECK_SIZE && !out.includes(c)) out.push(c);
+  return { ids: shuffle(out).map((c) => c.id), reviews: due.length };
+}
+function deckState() {
+  let d = store.get("deck", null);
+  const valid = d && d.day === dayKey() && Array.isArray(d.ids) && d.ids.length && d.ids.every((id) => CARD[id]);
+  if (!valid) {
+    const built = buildDeck();
+    d = { day: dayKey(), ids: built.ids, reviews: built.reviews, results: [], pos: 0 };
+    store.set("deck", d);
+  }
+  return d;
+}
+
+function startDeck() {
+  clearTimeout(nextTimer);
+  const d = deckState();
+  const cards = d.ids.map((id) => CARD[id]);
+  const results = d.results.map((ok, i) => ({ correct: ok, show: { icon: ok ? "✓" : "✗", title: cards[i].t, sub: cards[i].x }, pts: 0 }));
+  quiz = { mode: DECK, questions: cards, i: Math.min(d.pos, cards.length), results, points: 0 };
+  showQuiz();
+  renderModeSwitcher();
+  if (d.pos >= cards.length) renderResult();
+  else renderQuestion();
+}
+
+function renderDeck(card) {
+  $("#quiz-body").innerHTML = `
+    <div class="card-face">
+      <p class="card-topic"><span class="cat">${CTOPIC_LABEL[card.topic]}</span></p>
+      <h2 class="card-title">${esc(card.t)}</h2>
+      <p class="card-text">${esc(card.x)}</p>
+      <p class="card-why"><b>Dlaczego to ważne:</b> ${esc(card.w)}</p>
+    </div>
+    <div class="card-actions"><button class="btn wide" id="to-q" type="button">Do pytania</button></div>`;
+  $("#to-q").addEventListener("click", () => {
+    const opts = shuffle(card.o.map((text, i) => ({ text, ok: i === 0 })));
+    $("#quiz-body").innerHTML = `
+      <div class="prompt"><p class="prompt-label">${esc(card.t)}</p><h2 class="prompt-statement">${esc(card.q)}</h2></div>
+      <div class="answers">${opts.map((o, i) => `<button class="answer" data-i="${i}">${esc(o.text)}</button>`).join("")}</div>
+      ${FEEDBACK}`;
+    $("#quiz-body").querySelectorAll(".answer").forEach((btn) => btn.addEventListener("click", () => {
+      const correct = opts[Number(btn.dataset.i)].ok;
+      $("#quiz-body").querySelectorAll(".answer").forEach((b, i) => { b.disabled = true; if (opts[i].ok) b.classList.add("correct"); });
+      if (!correct) btn.classList.add("wrong");
+      saveRec("cards", card.id, correct);
+      const d = deckState();
+      d.results[quiz.i] = correct;
+      d.pos = Math.max(d.pos, quiz.i + 1);
+      store.set("deck", d);
+      settle({
+        correct,
+        show: { icon: "✗", title: card.t, sub: card.o[0] },
+        feedback: correct ? "" : `<p>Poprawna odpowiedź: <strong>${esc(card.o[0])}</strong></p>`,
+      });
+    }, { once: true }));
+  });
+}
+
+/* ---------- Ergebnis ---------- */
+function renderResult() {
+  const { mode, results } = quiz;
+  const score = results.filter((r) => r.correct).length;
+  const total = results.length;
+  if (!activity.includes(dayKey())) { activity.push(dayKey()); activity = activity.slice(-400); store.set("activity", activity); }
+  if (mode.id !== "cards") {
+    const best = store.get("best", {});
+    if ((best[mode.id] ?? -1) < score) { best[mode.id] = score; store.set("best", best); }
+  }
+
+  const msg =
+    mode.noAgain ? "Na dziś wystarczy. Jutro czeka 10 nowych kart, a błędne odpowiedzi wrócą w międzyczasie." :
+    mode.sr
+      ? (score === total ? "Bezbłędnie. Te pytania wrócą dopiero za kilka dni."
+        : score >= total * 0.7 ? "Dobra runda. Błędy wrócą w następnej rundzie."
+        : "Błędne odpowiedzi wrócą od razu w następnej rundzie. Dzięki temu wiedza się utrwala.")
+      : (score === total ? "Bezbłędnie. Jeszcze jedna runda?" : score >= total * 0.7 ? "Dobra runda." : "Jest jeszcze miejsce na poprawę. Nowa runda przyniesie nowe zadania.");
+
+  const wrong = results.filter((r) => !r.correct);
+  renderDots();
+  $("#quiz-count").textContent = "";
+  $("#quiz-body").innerHTML = `
+    <div class="result">
+      <p class="result-score">${score}<small> z ${total}</small></p>
+      ${mode.scored && quiz.points ? `<p class="result-points">${quiz.points} ${plural(quiz.points, ["punkt", "punkty", "punktów"])}</p>` : ""}
+      <p class="result-msg">${msg}</p>
+      ${wrong.length ? `<ul class="mistakes">${wrong.map((r) => `
+        <li><span class="f">${esc(r.show.icon)}</span>
+          <div><strong>${esc(r.show.title)}</strong>${r.show.sub ? `<span>${esc(r.show.sub)}</span>` : ""}</div>
+        </li>`).join("")}</ul>` : ""}
+    </div>
+    <div class="result-actions${mode.noAgain ? " single" : ""}">
+      <button class="btn ghost" id="done">Gotowe</button>
+      ${mode.noAgain ? "" : `<button class="btn" id="again">Następna runda</button>`}
+    </div>`;
+  $("#done").addEventListener("click", closeQuiz);
+  $("#again")?.addEventListener("click", () => startQuiz(mode));
+}
+
+/* ---------- Zurück wischen: vom linken Rand nach rechts ---------- */
+const TAB_ORDER = ["news", "lesen", "learn"];
+function goBack() {
+  if (!$("#sheet").hidden) { sheetBack(); return true; }      // Profil oder Album
+  if (!$("#quiz").hidden) { closeQuiz(); return true; }        // Spiel
+  const i = TAB_ORDER.indexOf(currentTab);
+  if (i > 0) { showTab(TAB_ORDER[i - 1]); return true; }       // ein Reiter zurück
+  return false;
+}
+(() => {
+  const EDGE = 24, TRIGGER = 90;
+  let sx = 0, sy = 0, dx = 0, t0 = 0, tracking = false, active = false, el = null;
+  const topOverlay = () => (!$("#sheet").hidden ? $("#sheet") : !$("#quiz").hidden ? $("#quiz") : null);
+  window.addEventListener("touchstart", (e) => {
+    if (e.touches.length !== 1 || e.touches[0].clientX > EDGE) return;
+    const t = e.touches[0];
+    tracking = true; active = false; sx = t.clientX; sy = t.clientY; dx = 0; t0 = Date.now(); el = topOverlay();
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (!tracking) return;
+    const t = e.touches[0];
+    dx = t.clientX - sx;
+    const dy = t.clientY - sy;
+    if (!active) {
+      if (Math.abs(dy) > Math.abs(dx) && Math.abs(dy) > 10) { tracking = false; return; } // senkrecht: normales Scrollen
+      if (dx > 8) active = true; else return;
+    }
+    e.preventDefault();
+    if (el) { el.style.transition = "none"; el.style.transform = `translateX(${Math.max(0, dx)}px)`; }
+  }, { passive: false });
+  const end = () => {
+    if (!tracking) return;
+    tracking = false;
+    const fast = dx / Math.max(1, Date.now() - t0) > 0.6;
+    const go = active && (dx > TRIGGER || (fast && dx > 40));
+    const node = el;
+    el = null; active = false;
+    if (node) {
+      node.style.transition = "transform 0.2s ease";
+      node.style.transform = go ? "translateX(100%)" : "translateX(0)";
+      setTimeout(() => {
+        node.style.transition = "none"; node.style.transform = "";
+        if (go) goBack();
+        requestAnimationFrame(() => { node.style.transition = ""; });
+      }, 210);
+    } else if (go) goBack();
+  };
+  window.addEventListener("touchend", end);
+  window.addEventListener("touchcancel", end);
+})();
+
+/* ---------- Start ---------- */
+async function init() {
+  showTab(currentTab);
+  loadNews();
+  const get = (u) => fetch(u).then((r) => { if (!r.ok) throw new Error(u); return r.json(); });
+  try {
+    countries = await get("countries.json");
+  } catch {
+    $("#modes").innerHTML = `<div class="empty"><strong>Brak danych o krajach</strong>Nie udało się wczytać pliku countries.json.</div>`;
+  }
+  try {
+    CONTENT = await get("content.json");
+    CONTENT.people.forEach((p) => { PEOPLE[p.id] = p; });
+    CONTENT.cards.forEach((c) => { CARD[c.id] = c; });
+    buildGraph();
+  } catch { CONTENT = null; }
+  try {
+    PORTRAITS = (await get("portraits/portraits.json")).items || {};
+  } catch { PORTRAITS = {}; }
+  try {
+    MAPD = await get("map.json");
+    MAPD.countries.forEach((m) => { if (m.i) MAPIDX[m.i] = { s: Math.max(m.s, MAPIDX[m.i]?.s || 0) }; });
+    const inQuiz = new Set(countries.map((c) => c.id));
+    MAP_MARKUP = MAPD.countries.map((m) => `<path class="land${m.i && inQuiz.has(m.i) ? "" : " bg"}" data-id="${m.i || ""}" d="${m.d}"/>`).join("");
+  } catch { MAPD = null; }
+  renderLearn();
+  if ("serviceWorker" in navigator && location.protocol === "https:") {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+}
+init();
